@@ -288,6 +288,23 @@ const norm = (t="") =>
    .replace(/[أإآٱ]/g,"ا").replace(/ة/g,"ه").replace(/ى/g,"ي")
    .replace(/\s+/g," ").trim();
 const hasMicSupport = () => !!(navigator.mediaDevices && navigator.mediaDevices.getUserMedia && window.MediaRecorder);
+const AR=["٠","١","٢","٣","٤","٥","٦","٧","٨","٩"];
+const arNum = n => String(n).replace(/\d/g,d=>AR[d]);
+function levenshtein(a,b){
+  const m=a.length,n=b.length;
+  if(m===0) return n; if(n===0) return m;
+  const dp=new Array(n+1);
+  for(let j=0;j<=n;j++) dp[j]=j;
+  for(let i=1;i<=m;i++){
+    let prev=dp[0]; dp[0]=i;
+    for(let j=1;j<=n;j++){
+      const tmp=dp[j];
+      dp[j]=Math.min(dp[j]+1, dp[j-1]+1, prev+(a[i-1]===b[j-1]?0:1));
+      prev=tmp;
+    }
+  }
+  return dp[n];
+}
 
 /* ═══════════════════════════════════════════════════════════
    MODULE PHONÉTIQUE ARABE — Alignement robuste au tajwid
@@ -373,6 +390,8 @@ function findBestBaytAlignment(baytText, recognizedText, tolerance){
 }
 
 
+const MATCH_TOLERANCE = 0.34; // ~1/3 de caractères de tolérance (mode "normal")
+const TOLERANCE_PRESETS = { strict:0.20, normal:0.34, loose:0.48 };
 function tryAdvance(ptr, wsNorm, recognizedText, factor){
   const tol = factor || MATCH_TOLERANCE;
   const rFlat = norm(recognizedText).replace(/\s+/g,"");
@@ -432,6 +451,7 @@ function wordQuality(wordNorm, recognizedText){
    On enregistre l'audio du micro par petits segments (coupés automatiquement aux silences),
    chaque segment est envoyé à /.netlify/functions/transcribe qui interroge Whisper sur Groq. */
 const BUFFER_TICK_MS = 800;      // fréquence d'accumulation + tentative d'envoi
+const VOICE_RMS_THRESHOLD = 0.02; // seuil au-delà duquel on considère qu'il y a de la voix
 const RATE_LIMIT_MAX = 18;       // marge de sécurité sous les 20 req/min gratuites de Groq
 const RATE_LIMIT_WINDOW_MS = 60000; // fenêtre glissante d'une minute
 const EPISODE_MAX_MS = 8000;     // taille max d'un épisode avant redémarrage (après envoi réussi)
@@ -465,6 +485,9 @@ function useAsrRecording(onTranscript, tFn){
   const sendingRef=useRef(false);
   const onTranscriptRef=useRef(onTranscript);
   onTranscriptRef.current=onTranscript;
+  // VAD léger : évite d'envoyer (et donc de faire halluciner Whisper sur) du silence pur.
+  const audioCtxRef=useRef(null), analyserRef=useRef(null), rafRef=useRef(null);
+  const hasVoiceRef=useRef(false);
 
   const canSendNow=()=>{
     const now=Date.now();
@@ -472,10 +495,23 @@ function useAsrRecording(onTranscript, tFn){
     return sendTimestampsRef.current.length<RATE_LIMIT_MAX;
   };
 
+  const monitorVoice=()=>{
+    if(!listeningRef.current || !analyserRef.current) return;
+    const analyser=analyserRef.current;
+    const arr=new Uint8Array(analyser.fftSize);
+    analyser.getByteTimeDomainData(arr);
+    let sum=0; for(let i=0;i<arr.length;i++){const v=(arr[i]-128)/128; sum+=v*v;}
+    const rms=Math.sqrt(sum/arr.length);
+    if(rms>VOICE_RMS_THRESHOLD) hasVoiceRef.current=true;
+    rafRef.current=requestAnimationFrame(monitorVoice);
+  };
+
   const cleanup=()=>{
     listeningRef.current=false;
+    if(rafRef.current){ cancelAnimationFrame(rafRef.current); rafRef.current=null; }
     if(recRef.current){ try{recRef.current.ondataavailable=null;recRef.current.onstop=null;if(recRef.current.state!=="inactive")recRef.current.stop();}catch(e){} recRef.current=null; }
     if(streamRef.current){ streamRef.current.getTracks().forEach(t=>t.stop()); streamRef.current=null; }
+    if(audioCtxRef.current){ try{audioCtxRef.current.close();}catch(e){} audioCtxRef.current=null; analyserRef.current=null; }
     setListening(false);
   };
 
@@ -510,6 +546,7 @@ function useAsrRecording(onTranscript, tFn){
   const sendSnapshot=async(forceRestart)=>{
     if(sendingRef.current) return;
     if(dataRef.current.length===0) return;
+    if(!hasVoiceRef.current) return; // rien de vocal détecté depuis le début de l'épisode : on n'envoie pas de silence
     if(!canSendNow()) return; // budget de la minute épuisé : on patiente, l'audio continue de s'accumuler
     const blob=new Blob(dataRef.current,{type:mimeRef.current||"audio/webm"});
     if(blob.size<MIN_BLOB_BYTES) return;
@@ -529,6 +566,7 @@ function useAsrRecording(onTranscript, tFn){
     if(!streamRef.current || !listeningRef.current) return;
     if(recRef.current){ try{recRef.current.ondataavailable=null;recRef.current.onstop=null;if(recRef.current.state!=="inactive")recRef.current.stop();}catch(e){} }
     dataRef.current=[];
+    hasVoiceRef.current=false;
     const mr=new MediaRecorder(streamRef.current, mimeRef.current?{mimeType:mimeRef.current}:undefined);
     mr.ondataavailable=(e)=>{
       if(e.data && e.data.size>0) dataRef.current.push(e.data);
@@ -550,8 +588,14 @@ function useAsrRecording(onTranscript, tFn){
       const stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}});
       streamRef.current=stream;
       mimeRef.current=pickMimeType();
+      const Ctx=window.AudioContext||window.webkitAudioContext;
+      const ctx=new Ctx(); audioCtxRef.current=ctx;
+      const src=ctx.createMediaStreamSource(stream);
+      const analyser=ctx.createAnalyser(); analyser.fftSize=1024;
+      src.connect(analyser); analyserRef.current=analyser;
       listeningRef.current=true; setListening(true);
       restartEpisode();
+      rafRef.current=requestAnimationFrame(monitorVoice);
     }catch(err){
       if(err && (err.name==="NotAllowedError"||err.name==="PermissionDeniedError")) setSrError(tFn("errMic"));
       else setSrError(tFn("errStart")(err && err.message?err.message:String(err)));
