@@ -446,6 +446,22 @@ function wordQuality(wordNorm, recognizedText){
   return rFlat.includes(wordNorm) ? 1 : 2; // 1 = net, 2 = via tolérance (liaison/légère variation)
 }
 
+/* Détection d'erreur type Tarteel : Whisper a entendu de la parole mais aucun
+   des premiers mots reconnus ne ressemble phonétiquement au mot attendu.
+   Renvoie true si on doit marquer le mot courant comme erreur. */
+function isClearMismatch(expectedNormWord, recognizedText){
+  if(!expectedNormWord) return false;
+  const recWords = norm(recognizedText).split(/\s+/).filter(w=>w.length>1);
+  if(recWords.length<2) return false; // pas assez d'audio, on attend
+  let best=0;
+  const look = Math.min(recWords.length, 6);
+  for(let i=0;i<look;i++){
+    const sc = phoneticScore(expectedNormWord, recWords[i]);
+    if(sc>best) best=sc;
+  }
+  return best < 0.45;
+}
+
 /* ════════════ RECONNAISSANCE VOCALE — Whisper (Groq) via Netlify Function ════════════
    Remplace l'ancienne Web Speech API (Chrome/Android uniquement, souvent lente/imprécise).
    On enregistre l'audio du micro par petits segments (coupés automatiquement aux silences),
@@ -5839,17 +5855,20 @@ const CATALOG = [
 /* ════════════ WORD ════════════ */
 const Word = ({text,revealed,quality}) => {
   const len=text.replace(/[\u064B-\u065F\u0670\u0640]/g,"").length;
-  if(!revealed){
+  const isError = quality===3;
+  if(!revealed && !isError){
     return <span style={{display:"inline-block",height:24,minWidth:Math.max(18,len*11),margin:"0 3px",verticalAlign:"middle",borderRadius:7,background:"linear-gradient(180deg,rgba(255,255,255,0.11),rgba(255,255,255,0.045))",border:"1px solid rgba(255,255,255,0.06)"}}/>;
   }
   const isFuzzy = quality===2;
   return (
     <span style={{
       fontFamily:"'Scheherazade New',serif",fontSize:"var(--az)",lineHeight:1.9,
-      color: isFuzzy ? "#e8c86a" : "var(--wrd-col)",
+      color: isError ? "#ff6b6b" : isFuzzy ? "#e8c86a" : "var(--wrd-col)",
       margin:"0 3px",display:"inline-block",animation:"wrd .35s ease",direction:"rtl",
-      borderBottom: isFuzzy ? "2px dotted rgba(232,200,106,0.55)" : "2px solid transparent",
-      paddingBottom:1,
+      borderBottom: isError ? "2px solid rgba(255,107,107,0.85)" : isFuzzy ? "2px dotted rgba(232,200,106,0.55)" : "2px solid transparent",
+      background: isError ? "rgba(255,107,107,0.10)" : "transparent",
+      borderRadius: isError ? 6 : 0,
+      padding: isError ? "0 4px 1px" : "0 0 1px",
     }}>{text}</span>
   );
 };
@@ -6061,7 +6080,9 @@ function SingleBaytFlow({bab,mode,onProgress,progress,showAll,tFn,onBack,tolFact
   const [bi,setBi]=useState(0);
   const [mask,setMask]=useState([]);
   const [done,setDone]=useState(false);
+  const [hasError,setHasError]=useState(false);
   const ptrRef=useRef(0),maskRef=useRef([]),procRef=useRef(null);
+  const misfitRef=useRef(0);
 
   const baytText=bab.bayts[bi]||"";
   const words=baytText.replace(/#/g," ").split(/\s+/).filter(Boolean);
@@ -6072,11 +6093,20 @@ function SingleBaytFlow({bab,mode,onProgress,progress,showAll,tFn,onBack,tolFact
     const wsNorm=ws.map(norm);
     const newPtr=tryAdvance(ptrRef.current, wsNorm, text, tolFactor);
     if(newPtr>ptrRef.current){
+      misfitRef.current=0;
       for(let i=ptrRef.current;i<newPtr;i++) maskRef.current[i]=wordQuality(wsNorm[i],text);
       ptrRef.current=newPtr;
       setMask([...maskRef.current]);
+      setHasError(false);
       if(newPtr>=ws.length){setDone(true);onProgress(bab.id,bi);stopFn();}
       return true;
+    }
+    // Pas d'avancée : est-ce une vraie erreur (mot lu incorrect) ?
+    if(ptrRef.current<wsNorm.length && isClearMismatch(wsNorm[ptrRef.current], text)){
+      maskRef.current[ptrRef.current]=3;
+      setMask([...maskRef.current]);
+      setHasError(true);
+      stopFn();
     }
     return false;
   };
@@ -6086,7 +6116,7 @@ function SingleBaytFlow({bab,mode,onProgress,progress,showAll,tFn,onBack,tolFact
   useEffect(()=>{
     const w=(bab.bayts[bi]||"").replace(/#/g," ").split(/\s+/).filter(Boolean);
     ptrRef.current=0;maskRef.current=new Array(w.length).fill(false);
-    setMask(new Array(w.length).fill(false));setDone(false);
+    setMask(new Array(w.length).fill(false));setDone(false);setHasError(false);misfitRef.current=0;
   },[bi,bab.id]);
 
   const revealOne=()=>{
@@ -6094,7 +6124,8 @@ function SingleBaytFlow({bab,mode,onProgress,progress,showAll,tFn,onBack,tolFact
     const ptr=ptrRef.current;
     if(ptr<ws.length){maskRef.current[ptr]=1;ptrRef.current=ptr+1;setMask([...maskRef.current]);if(ptr+1>=ws.length){setDone(true);onProgress(bab.id,bi);}}
   };
-  const reset=()=>{stopFn();ptrRef.current=0;maskRef.current=new Array(words.length).fill(false);setMask(new Array(words.length).fill(false));setDone(false);};
+  const reset=()=>{stopFn();ptrRef.current=0;maskRef.current=new Array(words.length).fill(false);setMask(new Array(words.length).fill(false));setDone(false);setHasError(false);misfitRef.current=0;};
+  const retryFromError=()=>{if(ptrRef.current<maskRef.current.length){maskRef.current[ptrRef.current]=false;}setMask([...maskRef.current]);setHasError(false);misfitRef.current=0;toggle();};
   const prev=()=>{stopFn();setBi(x=>Math.max(0,x-1));};
   const next=()=>{stopFn();setBi(x=>Math.min(bab.bayts.length-1,x+1));};
   const revealed=mask.filter(Boolean).length;
@@ -6121,6 +6152,13 @@ function SingleBaytFlow({bab,mode,onProgress,progress,showAll,tFn,onBack,tolFact
           <div style={{marginTop:14,background:"rgba(180,255,210,0.07)",border:"1px solid rgba(180,255,210,0.18)",borderRadius:16,padding:"14px 20px",textAlign:"center",width:"100%",maxWidth:500}}>
             <div style={{fontSize:24,marginBottom:2}}>{bi===bab.bayts.length-1?"🏆":"🌟"}</div>
             <div style={{fontFamily:"'Scheherazade New',serif",fontSize:20,color:"#b8f5cc"}}>{bi===bab.bayts.length-1?tFn("babDone"):tFn("ahsant")}</div>
+          </div>
+        )}
+        {hasError&&(
+          <div style={{marginTop:12,background:"rgba(255,107,107,0.10)",border:"1px solid rgba(255,107,107,0.35)",borderRadius:14,padding:"12px 16px",textAlign:"center",width:"100%",maxWidth:500}}>
+            <div style={{fontSize:22,marginBottom:4}}>✋</div>
+            <div style={{fontSize:13,color:"#ffb3b3",marginBottom:10,lineHeight:1.5}}>Mot en rouge : reprends depuis ce mot.</div>
+            <button onClick={retryFromError} style={{background:"linear-gradient(135deg,#c0392b,#e74c3c)",color:"#fff",border:"none",borderRadius:10,padding:"9px 18px",fontSize:13,fontWeight:600,cursor:"pointer"}}>🎤 Réessayer</button>
           </div>
         )}
         {listening&&(
@@ -6182,9 +6220,11 @@ function ContinuousFlow({bab,isAll,mode,setMode,onProgress,showAll,setShowAll,tF
   },[bab.id]);
 
   const [mask,setMask]=useState(()=>new Array(flat.length).fill(false));
+  const [hasError,setHasError]=useState(false);
   const ptrRef=useRef(0),maskRef=useRef(new Array(flat.length).fill(false));
   const procRef=useRef(null);
   const baytRefs=useRef({});
+  const misfitRef=useRef(0);
 
   const markBaytDone=(bIdx)=>{
     if(isAll){
@@ -6199,14 +6239,22 @@ function ContinuousFlow({bab,isAll,mode,setMode,onProgress,showAll,setShowAll,tF
     const wsNorm=flat.map(f=>norm(f.word));
     const newPtr=tryAdvance(ptrRef.current, wsNorm, text, tolFactor);
     if(newPtr>ptrRef.current){
+      misfitRef.current=0;
       for(let i=ptrRef.current;i<newPtr;i++){
         maskRef.current[i]=wordQuality(wsNorm[i],text);
         if(flat[i].lastOfBayt) markBaytDone(flat[i].bIdx);
       }
       ptrRef.current=newPtr;
       setMask([...maskRef.current]);
+      setHasError(false);
       if(newPtr>=flat.length) stopFn();
       return true;
+    }
+    if(ptrRef.current<wsNorm.length && isClearMismatch(wsNorm[ptrRef.current], text)){
+      maskRef.current[ptrRef.current]=3;
+      setMask([...maskRef.current]);
+      setHasError(true);
+      stopFn();
     }
     return false;
   };
@@ -6221,7 +6269,8 @@ function ContinuousFlow({bab,isAll,mode,setMode,onProgress,showAll,setShowAll,tF
       ptrRef.current=ptr+1;setMask([...maskRef.current]);
     }
   };
-  const resetAll=()=>{stopFn();ptrRef.current=0;maskRef.current=new Array(flat.length).fill(false);setMask(new Array(flat.length).fill(false));};
+  const resetAll=()=>{stopFn();ptrRef.current=0;maskRef.current=new Array(flat.length).fill(false);setMask(new Array(flat.length).fill(false));setHasError(false);misfitRef.current=0;};
+  const retryFromError=()=>{if(ptrRef.current<maskRef.current.length){maskRef.current[ptrRef.current]=false;}setMask([...maskRef.current]);setHasError(false);misfitRef.current=0;toggle();};
 
   const activeBIdx = ptrRef.current<flat.length ? flat[ptrRef.current].bIdx : bab.bayts.length-1;
   const isFullyDone = ptrRef.current>=flat.length;
@@ -6290,6 +6339,13 @@ function ContinuousFlow({bab,isAll,mode,setMode,onProgress,showAll,setShowAll,tF
             <div style={{fontSize:30,marginBottom:4}}>🏆</div>
             <div style={{fontFamily:"'Scheherazade New',serif",fontSize:22,color:"#b8f5cc"}}>{isAll?tFn("matnDone"):tFn("babDone")}</div>
             <div style={{fontSize:12,color:"var(--sub)",marginTop:3}}>{tFn("barakAllah")}</div>
+          </div>
+        )}
+        {hasError&&(
+          <div style={{marginTop:14,background:"rgba(255,107,107,0.10)",border:"1px solid rgba(255,107,107,0.35)",borderRadius:14,padding:"12px 16px",textAlign:"center",maxWidth:500,marginLeft:"auto",marginRight:"auto"}}>
+            <div style={{fontSize:22,marginBottom:4}}>✋</div>
+            <div style={{fontSize:13,color:"#ffb3b3",marginBottom:10,lineHeight:1.5}}>Mot en rouge : reprends depuis ce mot.</div>
+            <button onClick={retryFromError} style={{background:"linear-gradient(135deg,#c0392b,#e74c3c)",color:"#fff",border:"none",borderRadius:10,padding:"9px 18px",fontSize:13,fontWeight:600,cursor:"pointer"}}>🎤 Réessayer</button>
           </div>
         )}
         {listening&&(
