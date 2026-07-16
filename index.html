@@ -450,8 +450,9 @@ function wordQuality(wordNorm, recognizedText){
    Remplace l'ancienne Web Speech API (Chrome/Android uniquement, souvent lente/imprécise).
    On enregistre l'audio du micro par petits segments (coupés automatiquement aux silences),
    chaque segment est envoyé à /.netlify/functions/transcribe qui interroge Whisper sur Groq. */
-const BUFFER_TICK_MS = 800;      // fréquence d'accumulation + tentative d'envoi
+const BUFFER_TICK_MS = 600;      // fréquence d'accumulation + tentative d'envoi
 const VOICE_RMS_THRESHOLD = 0.02; // seuil au-delà duquel on considère qu'il y a de la voix
+const MIN_CLIP_MS = 350; // durée mini avant un envoi (juste pour éviter les micro-fragments quasi vides)
 const RATE_LIMIT_MAX = 18;       // marge de sécurité sous les 20 req/min gratuites de Groq
 const RATE_LIMIT_WINDOW_MS = 60000; // fenêtre glissante d'une minute
 const EPISODE_MAX_MS = 8000;     // taille max d'un épisode avant redémarrage (après envoi réussi)
@@ -554,6 +555,7 @@ function useAsrRecording(onTranscript, tFn){
     if(sendingRef.current) return;
     if(dataRef.current.length===0) return;
     if(!hasVoiceRef.current) return; // rien de vocal détecté depuis le début de l'épisode : on n'envoie pas de silence
+    if(Date.now()-episodeStartRef.current<MIN_CLIP_MS) return; // trop court pour être fiable, Whisper se trompe souvent sur <1s
     if(!canSendNow()) return; // budget de la minute épuisé : on patiente, l'audio continue de s'accumuler
     const blob=new Blob(dataRef.current,{type:mimeRef.current||"audio/webm"});
     if(blob.size<MIN_BLOB_BYTES) return;
