@@ -139,6 +139,7 @@ const TR = {
     tolHint:'« Souple » avale plus facilement les liaisons (ikhfa, idgham) — utile si tu récites vite.',
     legendFuzzy:'soulignement pointillé = reconnu grâce à la tolérance',
     debugHeard:'Compris',
+    quotaWaitTxt:'Quota atteint, ça repart dans un instant...',
     installedTitle:'✓ Application installée',
     installedDesc:'Elle fonctionne aussi hors-ligne pour les textes déjà ouverts.',
     installTitle:"📲 Installer l'app sur l'écran d'accueil",
@@ -190,6 +191,7 @@ const TR = {
     tolHint:'"Loose" absorbs liaisons (ikhfa, idgham) more easily — useful when reciting fast.',
     legendFuzzy:'dotted underline = matched via tolerance',
     debugHeard:'Heard',
+    quotaWaitTxt:'Quota reached, resuming shortly...',
     installedTitle:'✓ App installed',
     installedDesc:'It also works offline for texts already opened.',
     installTitle:'📲 Install the app on your home screen',
@@ -241,6 +243,7 @@ const TR = {
     tolHint:'"مرنة" تتقبّل الإخفاء والإدغام بسهولة أكبر — مفيدة عند التلاوة بسرعة.',
     legendFuzzy:'خط منقّط = تم التعرف عليه بفضل هامش التساهل',
     debugHeard:'المسموع',
+    quotaWaitTxt:'تم بلوغ الحد الأقصى، سيتابع بعد لحظة...',
     installedTitle:'✓ تم تثبيت التطبيق',
     installedDesc:'يعمل أيضاً بدون اتصال بالنسبة للنصوص المفتوحة مسبقاً.',
     installTitle:'📲 ثبّت التطبيق على الشاشة الرئيسية',
@@ -347,7 +350,7 @@ function phoneticScore(a,b){
 
 function alignWords(expectedArr, recognizedText, tolerance){
   const rec = norm(recognizedText).split(/\s+/).filter(w=>w.length>0);
-  const thr = {strict:0.65, normal:0.50, loose:0.35}[tolerance] || 0.50;
+  const thr = {strict:0.72, normal:0.56, loose:0.42}[tolerance] || 0.56;
 
   const matches = [];
   let recIdx = 0;
@@ -389,9 +392,31 @@ function findBestBaytAlignment(baytText, recognizedText, tolerance){
   return { coverage, lastMatch, matches, totalWords:words.length, matchedWords:matched, isComplete: coverage>=0.80 };
 }
 
+/* finalizeMaskWithTranscript
+   Appelé quand l'utilisateur arrête l'écoute (ou termine).
+   Prend TOUT le transcript accumulé pendant la récitation et vérifie chaque mot
+   révélé. Un mot est marqué en rouge (quality=3) uniquement s'il n'apparaît pas
+   phonétiquement dans le transcript global — sinon il est confirmé (1 ou 2).
+   Les mots restés "provisoires" (avancés par VAD sans confirmation) sont soit
+   promus soit passés en rouge selon le transcript global. */
+function finalizeMaskWithTranscript(wsNorm, currentMask, fullTranscript, ptr){
+  if(!fullTranscript || !fullTranscript.trim()) return currentMask.slice();
+  const revealed = wsNorm.slice(0, ptr);
+  const matches = alignWords(revealed, fullTranscript, "loose");
+  const out = currentMask.slice();
+  for(let i=0;i<revealed.length;i++){
+    const m = matches[i];
+    if(!m) continue;
+    if(m.matched && m.score >= 0.72) out[i] = 1;           // net
+    else if(m.matched)                out[i] = 2;           // approximatif (tajwid, liaison)
+    else                              out[i] = 3;           // vraie erreur : mot absent du transcript
+  }
+  return out;
+}
 
-const MATCH_TOLERANCE = 0.34; // ~1/3 de caractères de tolérance (mode "normal")
-const TOLERANCE_PRESETS = { strict:0.20, normal:0.34, loose:0.48 };
+
+const MATCH_TOLERANCE = 0.44; // plus permissif : priorité fluidité, correction post-hoc
+const TOLERANCE_PRESETS = { strict:0.28, normal:0.44, loose:0.58 };
 function tryAdvance(ptr, wsNorm, recognizedText, factor){
   const tol = factor || MATCH_TOLERANCE;
   const rFlat = norm(recognizedText).replace(/\s+/g,"");
@@ -421,18 +446,24 @@ function tryAdvance(ptr, wsNorm, recognizedText, factor){
   }
 
   // VÉRIFICATION PHONÉTIQUE: Si l'alignement caractère est faible, 
-  // vérifier avec la phonétique
+  // vérifier avec la phonétique — en respectant le VRAI réglage de tolérance choisi
+  // (avant, ceci était figé sur "loose" quel que soit le réglage, trop permissif).
   if(bestPtr <= ptr && recognizedText.length > 10){
-    // Essayer l'alignement phonétique par mot
+    let modeName='normal';
+    for(const k in TOLERANCE_PRESETS){ if(TOLERANCE_PRESETS[k]===tol){ modeName=k; break; } }
+    const covThreshold = {strict:0.75, normal:0.62, loose:0.52}[modeName] || 0.62;
     const remainingWords = wsNorm.slice(ptr);
     const remainingText = remainingWords.join(" ");
-    const phonAlign = findBestBaytAlignment(remainingText, recognizedText, 'loose');
-    if(phonAlign.coverage >= 0.4){
+    const phonAlign = findBestBaytAlignment(remainingText, recognizedText, modeName);
+    if(phonAlign.coverage >= covThreshold){
       // Trouver le dernier mot reconnu
       let advanceBy = 0;
       for(let i=0; i<phonAlign.matches.length; i++){
         if(phonAlign.matches[i].matched) advanceBy = i+1;
       }
+      // Sécurité supplémentaire : un grand saut d'un coup (>3 mots) doit être particulièrement
+      // sûr, pour éviter qu'une transcription bruitée ne "termine" plusieurs mots à la fois.
+      if(advanceBy > 3 && phonAlign.coverage < covThreshold + 0.15) advanceBy = 0;
       if(advanceBy > 0) bestPtr = ptr + advanceBy;
     }
   }
@@ -479,6 +510,7 @@ function useAsrRecording(onTranscript, tFn){
   const [srError,setSrError]=useState(null);
   const [lastTranscript,setLastTranscript]=useState("");
   const [speaking,setSpeaking]=useState(false);
+  const [quotaWait,setQuotaWait]=useState(false);
   const streamRef=useRef(null);
   const recRef=useRef(null), dataRef=useRef([]), mimeRef=useRef("");
   const listeningRef=useRef(false);
@@ -495,7 +527,9 @@ function useAsrRecording(onTranscript, tFn){
   const canSendNow=()=>{
     const now=Date.now();
     sendTimestampsRef.current=sendTimestampsRef.current.filter(t=>now-t<RATE_LIMIT_WINDOW_MS);
-    return sendTimestampsRef.current.length<RATE_LIMIT_MAX;
+    const ok=sendTimestampsRef.current.length<RATE_LIMIT_MAX;
+    setQuotaWait(!ok);
+    return ok;
   };
 
   const monitorVoice=()=>{
@@ -591,6 +625,8 @@ function useAsrRecording(onTranscript, tFn){
 
   const startFn=async()=>{
     setSrError(null);
+    setLastTranscript("");
+    setQuotaWait(false);
     if(!hasMicSupport()){ setSrError(tFn("errChrome")); return; }
     if(location.protocol!=="https:"&&location.hostname!=="localhost"&&location.hostname!=="127.0.0.1"){ setSrError(tFn("errHttps")); return; }
     try{
@@ -615,7 +651,7 @@ function useAsrRecording(onTranscript, tFn){
   const stopFn=()=>cleanup();
   const toggle=()=>{ if(listening) stopFn(); else startFn(); };
 
-  return {listening, processing:processing>0, srError, toggle, stopFn, lastTranscript, speaking};
+  return {listening, processing:processing>0, srError, toggle, stopFn, lastTranscript, speaking, quotaWait};
 }
 
 /* ════════════ DATA — تحفة الأطفال 61 bayts ════════════ */
@@ -5857,13 +5893,22 @@ const Word = ({text,revealed,quality,pulsing}) => {
     }}/>;
   }
   const isFuzzy = quality===2;
+  const isError = quality===3;
+  const isProvisional = quality===-1;
+  let color = "var(--wrd-col)";
+  let border = "2px solid transparent";
+  if(isError){ color = "#ff6b6b"; border = "2px solid rgba(255,107,107,0.55)"; }
+  else if(isFuzzy){ color = "#e8c86a"; border = "2px dotted rgba(232,200,106,0.55)"; }
+  else if(isProvisional){ color = "rgba(200,245,216,0.62)"; border = "2px dashed rgba(255,255,255,0.18)"; }
   return (
     <span style={{
       fontFamily:"'Scheherazade New',serif",fontSize:"var(--az)",lineHeight:1.9,
-      color: isFuzzy ? "#e8c86a" : "var(--wrd-col)",
-      margin:"0 3px",display:"inline-block",animation:"wrd .35s ease",direction:"rtl",
-      borderBottom: isFuzzy ? "2px dotted rgba(232,200,106,0.55)" : "2px solid transparent",
+      color, margin:"0 3px",display:"inline-block",animation:"wrd .35s ease",direction:"rtl",
+      borderBottom: border,
       paddingBottom:1,
+      background: isError ? "rgba(255,107,107,0.06)" : "transparent",
+      borderRadius: isError ? 4 : 0,
+      padding: isError ? "0 3px" : 0,
     }}>{text}</span>
   );
 };
@@ -6076,6 +6121,8 @@ function SingleBaytFlow({bab,mode,onProgress,progress,showAll,tFn,onBack,tolFact
   const [mask,setMask]=useState([]);
   const [done,setDone]=useState(false);
   const ptrRef=useRef(0),maskRef=useRef([]),procRef=useRef(null);
+  const transcriptHistRef=useRef("");
+  const lastAdvanceAtRef=useRef(0);
 
   const baytText=bab.bayts[bi]||"";
   const words=baytText.replace(/#/g," ").split(/\s+/).filter(Boolean);
@@ -6084,22 +6131,69 @@ function SingleBaytFlow({bab,mode,onProgress,progress,showAll,tFn,onBack,tolFact
   procRef.current=(text)=>{
     const ws=(bab.bayts[bi]||"").replace(/#/g," ").split(/\s+/).filter(Boolean);
     const wsNorm=ws.map(norm);
+    if(text) transcriptHistRef.current = (transcriptHistRef.current + " " + text).trim();
     const newPtr=tryAdvance(ptrRef.current, wsNorm, text, tolFactor);
     if(newPtr>ptrRef.current){
-      for(let i=ptrRef.current;i<newPtr;i++) maskRef.current[i]=wordQuality(wsNorm[i],text);
+      for(let i=ptrRef.current;i<newPtr;i++){
+        // Promeut aussi les provisoires précédents s'ils sont maintenant validés
+        if(maskRef.current[i]!==1) maskRef.current[i]=wordQuality(wsNorm[i],text);
+      }
+      // Rétro-vérification : promeut les provisoires antérieurs qui apparaissent dans le transcript global
+      for(let i=0;i<ptrRef.current;i++){
+        if(maskRef.current[i]===-1){
+          const q=wordQuality(wsNorm[i], transcriptHistRef.current);
+          maskRef.current[i]=q;
+        }
+      }
       ptrRef.current=newPtr;
+      lastAdvanceAtRef.current=Date.now();
       setMask([...maskRef.current]);
-      if(newPtr>=ws.length){setDone(true);onProgress(bab.id,bi);stopFn();}
+      if(newPtr>=ws.length){setDone(true);onProgress(bab.id,bi);}
       return true;
     }
+    // JAMAIS d'arrêt sur mismatch : la validation se fait a posteriori
     return false;
   };
 
-  const {listening,processing,srError,toggle,stopFn,lastTranscript,speaking}=useAsrRecording((text)=>procRef.current(text), tFn);
+  const {listening,processing,srError,toggle,stopFn,lastTranscript,speaking,quotaWait}=useAsrRecording((text)=>procRef.current(text), tFn);
+
+  // Auto-avance VAD : si l'utilisateur parle depuis >1.4s sans qu'aucun mot n'ait avancé,
+  // on fait avancer d'un mot en "provisoire" (quality=-1). Sera confirmé/rejeté par Whisper ensuite.
+  useEffect(()=>{
+    if(!listening || mode!=="voice") return;
+    const id=setInterval(()=>{
+      if(!speaking) return;
+      const ws=(bab.bayts[bi]||"").replace(/#/g," ").split(/\s+/).filter(Boolean);
+      if(ptrRef.current>=ws.length) return;
+      const now=Date.now();
+      if(lastAdvanceAtRef.current===0) lastAdvanceAtRef.current=now;
+      if(now - lastAdvanceAtRef.current > 1400){
+        maskRef.current[ptrRef.current]=-1;
+        ptrRef.current+=1;
+        lastAdvanceAtRef.current=now;
+        setMask([...maskRef.current]);
+        if(ptrRef.current>=ws.length){setDone(true);onProgress(bab.id,bi);}
+      }
+    },250);
+    return ()=>clearInterval(id);
+  },[listening,speaking,mode,bi,bab.id]);
+
+  // Finalisation quand on arrête l'écoute : marque en rouge les vrais mots erronés
+  useEffect(()=>{
+    if(listening) return;
+    if(ptrRef.current===0) return;
+    if(!transcriptHistRef.current) return;
+    const ws=(bab.bayts[bi]||"").replace(/#/g," ").split(/\s+/).filter(Boolean);
+    const wsNorm=ws.map(norm);
+    const finalMask=finalizeMaskWithTranscript(wsNorm, maskRef.current, transcriptHistRef.current, ptrRef.current);
+    maskRef.current=finalMask;
+    setMask([...finalMask]);
+  },[listening]);
 
   useEffect(()=>{
     const w=(bab.bayts[bi]||"").replace(/#/g," ").split(/\s+/).filter(Boolean);
     ptrRef.current=0;maskRef.current=new Array(w.length).fill(false);
+    transcriptHistRef.current=""; lastAdvanceAtRef.current=0;
     setMask(new Array(w.length).fill(false));setDone(false);
   },[bi,bab.id]);
 
@@ -6108,7 +6202,7 @@ function SingleBaytFlow({bab,mode,onProgress,progress,showAll,tFn,onBack,tolFact
     const ptr=ptrRef.current;
     if(ptr<ws.length){maskRef.current[ptr]=1;ptrRef.current=ptr+1;setMask([...maskRef.current]);if(ptr+1>=ws.length){setDone(true);onProgress(bab.id,bi);}}
   };
-  const reset=()=>{stopFn();ptrRef.current=0;maskRef.current=new Array(words.length).fill(false);setMask(new Array(words.length).fill(false));setDone(false);};
+  const reset=()=>{stopFn();ptrRef.current=0;maskRef.current=new Array(words.length).fill(false);transcriptHistRef.current="";lastAdvanceAtRef.current=0;setMask(new Array(words.length).fill(false));setDone(false);};
   const prev=()=>{stopFn();setBi(x=>Math.max(0,x-1));};
   const next=()=>{stopFn();setBi(x=>Math.min(bab.bayts.length-1,x+1));};
   const revealed=mask.filter(Boolean).length;
@@ -6140,7 +6234,7 @@ function SingleBaytFlow({bab,mode,onProgress,progress,showAll,tFn,onBack,tolFact
         {listening&&(
           <div style={{marginTop:10,display:"flex",alignItems:"center",gap:8,fontSize:12,color:"#7ab89a"}}>
             <span style={{width:8,height:8,borderRadius:"50%",background:processing?"#d4a843":"#e74c3c",display:"inline-block",animation:"pulse 1.2s ease infinite"}}/>
-            {processing?tFn("processingTxt"):tFn("listening")}
+            {quotaWait?tFn("quotaWaitTxt"):processing?tFn("processingTxt"):tFn("listening")}
           </div>
         )}
         {listening&&lastTranscript&&(
@@ -6199,6 +6293,8 @@ function ContinuousFlow({bab,isAll,mode,setMode,onProgress,showAll,setShowAll,tF
   const ptrRef=useRef(0),maskRef=useRef(new Array(flat.length).fill(false));
   const procRef=useRef(null);
   const baytRefs=useRef({});
+  const transcriptHistRef=useRef("");
+  const lastAdvanceAtRef=useRef(0);
 
   const markBaytDone=(bIdx)=>{
     if(isAll){
@@ -6211,21 +6307,60 @@ function ContinuousFlow({bab,isAll,mode,setMode,onProgress,showAll,setShowAll,tF
 
   procRef.current=(text)=>{
     const wsNorm=flat.map(f=>norm(f.word));
+    if(text) transcriptHistRef.current = (transcriptHistRef.current + " " + text).trim();
     const newPtr=tryAdvance(ptrRef.current, wsNorm, text, tolFactor);
     if(newPtr>ptrRef.current){
       for(let i=ptrRef.current;i<newPtr;i++){
-        maskRef.current[i]=wordQuality(wsNorm[i],text);
+        if(maskRef.current[i]!==1) maskRef.current[i]=wordQuality(wsNorm[i],text);
         if(flat[i].lastOfBayt) markBaytDone(flat[i].bIdx);
       }
+      // Rétro-vérification des provisoires
+      for(let i=0;i<ptrRef.current;i++){
+        if(maskRef.current[i]===-1){
+          maskRef.current[i]=wordQuality(wsNorm[i], transcriptHistRef.current);
+        }
+      }
       ptrRef.current=newPtr;
+      lastAdvanceAtRef.current=Date.now();
       setMask([...maskRef.current]);
-      if(newPtr>=flat.length) stopFn();
+      // Pas d'arrêt automatique en fin : l'utilisateur peut décider quand couper
       return true;
     }
+    // Jamais d'arrêt sur mismatch
     return false;
   };
 
-  const {listening,processing,srError,toggle,stopFn,lastTranscript,speaking}=useAsrRecording((text)=>procRef.current(text), tFn);
+  const {listening,processing,srError,toggle,stopFn,lastTranscript,speaking,quotaWait}=useAsrRecording((text)=>procRef.current(text), tFn);
+
+  // Auto-avance VAD (récitation fluide, correction a posteriori)
+  useEffect(()=>{
+    if(!listening || mode!=="voice") return;
+    const id=setInterval(()=>{
+      if(!speaking) return;
+      if(ptrRef.current>=flat.length) return;
+      const now=Date.now();
+      if(lastAdvanceAtRef.current===0) lastAdvanceAtRef.current=now;
+      if(now - lastAdvanceAtRef.current > 1400){
+        maskRef.current[ptrRef.current]=-1;
+        if(flat[ptrRef.current].lastOfBayt) markBaytDone(flat[ptrRef.current].bIdx);
+        ptrRef.current+=1;
+        lastAdvanceAtRef.current=now;
+        setMask([...maskRef.current]);
+      }
+    },250);
+    return ()=>clearInterval(id);
+  },[listening,speaking,mode,flat.length]);
+
+  // Finalisation post-écoute : rouge = vraies erreurs uniquement
+  useEffect(()=>{
+    if(listening) return;
+    if(ptrRef.current===0) return;
+    if(!transcriptHistRef.current) return;
+    const wsNorm=flat.map(f=>norm(f.word));
+    const finalMask=finalizeMaskWithTranscript(wsNorm, maskRef.current, transcriptHistRef.current, ptrRef.current);
+    maskRef.current=finalMask;
+    setMask([...finalMask]);
+  },[listening]);
 
   const revealOne=()=>{
     const ptr=ptrRef.current;
@@ -6235,7 +6370,7 @@ function ContinuousFlow({bab,isAll,mode,setMode,onProgress,showAll,setShowAll,tF
       ptrRef.current=ptr+1;setMask([...maskRef.current]);
     }
   };
-  const resetAll=()=>{stopFn();ptrRef.current=0;maskRef.current=new Array(flat.length).fill(false);setMask(new Array(flat.length).fill(false));};
+  const resetAll=()=>{stopFn();ptrRef.current=0;maskRef.current=new Array(flat.length).fill(false);transcriptHistRef.current="";lastAdvanceAtRef.current=0;setMask(new Array(flat.length).fill(false));};
 
   const activeBIdx = ptrRef.current<flat.length ? flat[ptrRef.current].bIdx : bab.bayts.length-1;
   const isFullyDone = ptrRef.current>=flat.length;
@@ -6309,7 +6444,7 @@ function ContinuousFlow({bab,isAll,mode,setMode,onProgress,showAll,setShowAll,tF
         {listening&&(
           <div style={{marginTop:14,display:"flex",alignItems:"center",justifyContent:"center",gap:8,fontSize:12,color:"var(--sub)"}}>
             <span style={{width:8,height:8,borderRadius:"50%",background:processing?"#d4a843":"#e74c3c",display:"inline-block",animation:"pulse 1.2s ease infinite"}}/>
-            {processing?tFn("processingTxt"):tFn("listening")}
+            {quotaWait?tFn("quotaWaitTxt"):processing?tFn("processingTxt"):tFn("listening")}
           </div>
         )}
         {listening&&lastTranscript&&(
